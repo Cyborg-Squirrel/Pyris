@@ -29,11 +29,12 @@ from .llm import (
     OpenAICompatibleSttClient,
     OpenAICompatibleVisionClient,
     PromptPart,
+    StreamingSttClient,
     SttClient,
     TextPart,
     VisionClient,
 )
-from .provider import MediaProvider
+from .provider import AudioStreamProvider, MediaProvider, TranscriptSink
 from .sampling import FrameSampler
 from .types import (
     AnalysisResult,
@@ -44,6 +45,7 @@ from .types import (
     RequestMode,
     TimeRange,
     Transcript,
+    TranscriptSegment,
     Usage,
 )
 
@@ -129,11 +131,13 @@ class Pyris:
         ffmpeg: Ffmpeg,
         vision: VisionClient,
         stt: SttClient | None = None,
+        streaming_stt: StreamingSttClient | None = None,
     ) -> None:
         self._config = config
         self._ffmpeg = ffmpeg
         self._vision = vision
         self._stt = stt
+        self._streaming_stt = streaming_stt
         self._sampler = FrameSampler(ffmpeg, config.sampling)
 
     @classmethod
@@ -146,11 +150,17 @@ class Pyris:
             config.request_timeout
         )
         stt: SttClient | None = None
+        streaming_stt: StreamingSttClient | None = None
         if config.stt is not None:
-            stt = OpenAICompatibleSttClient(config.stt).with_timeout(
+            # One client satisfies both the batch and streaming Protocols.
+            client = OpenAICompatibleSttClient(config.stt).with_timeout(
                 config.request_timeout
             )
-        return cls(config, ffmpeg=ffmpeg, vision=vision, stt=stt)
+            stt = client
+            streaming_stt = client
+        return cls(
+            config, ffmpeg=ffmpeg, vision=vision, stt=stt, streaming_stt=streaming_stt
+        )
 
     # -- public API ----------------------------------------------------------
 
@@ -229,12 +239,57 @@ class Pyris:
         finally:
             raw.close()
 
+    async def stream_stt(
+        self,
+        source: AudioStreamProvider,
+        sink: TranscriptSink,
+        *,
+        language: str | None = None,
+    ) -> Transcript:
+        """Audio-only *streaming* transcription — the live counterpart to
+        STT-mode :meth:`analyze`.
+
+        Pulls audio blobs from ``source``, pipes them to the streaming STT host,
+        and forwards each :class:`~pyris.types.TranscriptEvent` to ``sink`` the
+        moment it is produced, so a caller can render captions while audio is
+        still arriving. Returns the accumulated transcript (finalized segments,
+        in order) once the source is exhausted.
+
+        Unlike ``analyze`` there is no probe, ffmpeg, or vision step: the source
+        owns audio capture/encoding and the mode is fixed to STT. ``language``
+        overrides the configured STT language (``None`` = use config / autodetect).
+        The sink is always closed, even if the source or STT host errors.
+        """
+        stt = self._require_streaming_stt()
+        cfg = self._config.stt
+        assert cfg is not None  # guaranteed by _require_streaming_stt
+        lang = language if language is not None else cfg.language
+
+        finals: list[TranscriptSegment] = []
+        try:
+            async for event in stt.stream_transcribe(
+                source.stream(), model=cfg.model, language=lang
+            ):
+                await sink.emit(event)
+                if event.is_final:
+                    finals.append(event.segment)
+        finally:
+            await sink.aclose()
+        return Transcript(segments=finals, language=lang)
+
     # -- STT helpers ---------------------------------------------------------
 
     def _require_stt(self) -> SttClient:
         if self._stt is None or self._config.stt is None:
             raise ConfigError("STT requested but no STT client/config is set")
         return self._stt
+
+    def _require_streaming_stt(self) -> StreamingSttClient:
+        if self._streaming_stt is None or self._config.stt is None:
+            raise ConfigError(
+                "streaming STT requested but no streaming STT client/config is set"
+            )
+        return self._streaming_stt
 
     def _transcribe(self, raw: RawMedia, time_range: TimeRange | None) -> Transcript:
         stt = self._require_stt()
