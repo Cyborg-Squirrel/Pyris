@@ -123,6 +123,20 @@ class Transcript:
 
 
 @dataclass
+class TranscriptEvent:
+    """One incremental result from streaming STT — the unit that flows out to a
+    ``TranscriptSink`` while audio is still arriving.
+
+    ``is_final`` separates a stable, finalized segment from a revisable partial
+    hypothesis. A batch-per-blob backend (the bundled one) only ever emits finals;
+    a wire-streaming ASR backend also emits partials it may later supersede.
+    """
+
+    segment: TranscriptSegment
+    is_final: bool = True
+
+
+@dataclass
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0

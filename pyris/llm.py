@@ -25,14 +25,14 @@ import mimetypes
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from .config import SttConfig, VisionConfig
 from .errors import TranscriptionError, VisionError
-from .types import Frame, Transcript, TranscriptSegment, Usage
+from .types import Frame, Transcript, TranscriptEvent, TranscriptSegment, Usage
 
 
 @dataclass
@@ -80,6 +80,19 @@ class SttClient(Protocol):
     async def transcribe_async(
         self, audio: Path, *, model: str, language: str | None = None
     ) -> Transcript: ...
+
+
+class StreamingSttClient(Protocol):
+    def stream_transcribe(
+        self, audio: AsyncIterator[bytes], *, model: str, language: str | None = None
+    ) -> AsyncIterator[TranscriptEvent]:
+        """Consume a live stream of audio blobs and yield transcript events as
+        they are recognized. ``Pyris.stream_stt`` drives the returned iterator
+        and forwards each event to the caller's sink. Implementations are async
+        generators (``async def`` + ``yield``); batching/windowing, if any, lives
+        here, not in the pipeline.
+        """
+        ...
 
 
 def _join_url(base: str, path: str) -> str:
@@ -166,20 +179,7 @@ class OpenAICompatibleSttClient:
     def transcribe(
         self, audio: Path, *, model: str, language: str | None = None
     ) -> Transcript:
-        fields = {"model": model, "response_format": "verbose_json"}
-        if language:
-            fields["language"] = language
-        body, content_type = _encode_multipart(fields, audio)
-        headers = {
-            "Authorization": f"Bearer {self._config.api_key}",
-            "Content-Type": content_type,
-        }
-        req = urllib.request.Request(self._url, data=body, headers=headers)
-        try:
-            data = _send(req, self._timeout)
-        except _HttpFailure as exc:
-            raise TranscriptionError(str(exc)) from exc
-        return _parse_transcription(data)
+        return self._post_transcription(audio.name, audio.read_bytes(), model, language)
 
     async def transcribe_async(
         self, audio: Path, *, model: str, language: str | None = None
@@ -187,6 +187,54 @@ class OpenAICompatibleSttClient:
         return await asyncio.to_thread(
             self.transcribe, audio, model=model, language=language
         )
+
+    async def stream_transcribe(
+        self, audio: AsyncIterator[bytes], *, model: str, language: str | None = None
+    ) -> AsyncIterator[TranscriptEvent]:
+        """POST each incoming blob to ``/audio/transcriptions`` and emit its
+        segments as they come back, shifted onto a running timeline so timestamps
+        stay absolute across blobs. Each blob is transcribed on its own, so it
+        must be an independently-decodable audio file (see
+        :class:`~pyris.provider.AudioStreamProvider`).
+
+        This endpoint is request/response, not wire-streaming, so every event is
+        final; a websocket ASR backend implementing
+        :class:`StreamingSttClient` would additionally emit partials. The
+        blocking POST is offloaded per blob so the event loop stays free to keep
+        pulling audio and pushing results to the sink.
+        """
+        offset = 0.0
+        async for blob in audio:
+            transcript = await asyncio.to_thread(
+                self._post_transcription, "audio.wav", blob, model, language
+            )
+            for seg in transcript.segments:
+                yield TranscriptEvent(
+                    segment=TranscriptSegment(
+                        start=seg.start + offset,
+                        end=seg.end + offset,
+                        text=seg.text,
+                    )
+                )
+            offset += max((s.end for s in transcript.segments), default=0.0)
+
+    def _post_transcription(
+        self, filename: str, data: bytes, model: str, language: str | None
+    ) -> Transcript:
+        fields = {"model": model, "response_format": "verbose_json"}
+        if language:
+            fields["language"] = language
+        body, content_type = _encode_multipart_bytes(fields, filename, data)
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": content_type,
+        }
+        req = urllib.request.Request(self._url, data=body, headers=headers)
+        try:
+            resp = _send(req, self._timeout)
+        except _HttpFailure as exc:
+            raise TranscriptionError(str(exc)) from exc
+        return _parse_transcription(resp)
 
 
 # -- response/payload helpers -----------------------------------------------
@@ -233,6 +281,15 @@ def _parse_transcription(data: dict) -> Transcript:
 
 
 def _encode_multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, str]:
+    return _encode_multipart_bytes(fields, file_path.name, file_path.read_bytes())
+
+
+def _encode_multipart_bytes(
+    fields: dict[str, str], filename: str, data: bytes
+) -> tuple[bytes, str]:
+    """Build a ``multipart/form-data`` body from in-memory bytes. Shared by the
+    file path (``transcribe``) and the streaming path (``stream_transcribe``),
+    which has only a blob and no file on disk."""
     boundary = uuid.uuid4().hex
     crlf = b"\r\n"
     out: list[bytes] = []
@@ -243,16 +300,16 @@ def _encode_multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, s
             b"",
             value.encode("utf-8"),
         ]
-    file_mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    file_mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     out += [
         f"--{boundary}".encode(),
         (
             'Content-Disposition: form-data; name="file"; '
-            f'filename="{file_path.name}"'
+            f'filename="{filename}"'
         ).encode(),
         f"Content-Type: {file_mime}".encode(),
         b"",
-        file_path.read_bytes(),
+        data,
         f"--{boundary}--".encode(),
         b"",
     ]

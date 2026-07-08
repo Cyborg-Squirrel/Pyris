@@ -14,8 +14,12 @@ from .errors import (
 from .ffmpeg import SubprocessFfmpeg
 from .llm import OpenAICompatibleSttClient, OpenAICompatibleVisionClient
 from .pipeline import Pyris, build_timeline, resolve_mode
-from .provider import MediaProvider
-from .providers import FileProvider
+from .provider import AudioStreamProvider, MediaProvider, TranscriptSink
+from .providers import (
+    CallbackTranscriptSink,
+    FileProvider,
+    WavFileAudioStreamProvider,
+)
 from .types import (
     AnalysisResult,
     Frame,
@@ -25,6 +29,7 @@ from .types import (
     RequestMode,
     TimeRange,
     Transcript,
+    TranscriptEvent,
     TranscriptSegment,
     Usage,
 )
@@ -39,6 +44,10 @@ __all__ = [
     "SamplingConfig",
     "MediaProvider",
     "FileProvider",
+    "AudioStreamProvider",
+    "TranscriptSink",
+    "WavFileAudioStreamProvider",
+    "CallbackTranscriptSink",
     "SubprocessFfmpeg",
     "OpenAICompatibleVisionClient",
     "OpenAICompatibleSttClient",
@@ -50,6 +59,7 @@ __all__ = [
     "Frame",
     "Transcript",
     "TranscriptSegment",
+    "TranscriptEvent",
     "Usage",
     "AnalysisResult",
     "PyrisError",
