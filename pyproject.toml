@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyris"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Python vision + speech-to-text library powered by vision LLMs and Whisper."
 readme = "README.md"
 requires-python = ">=3.11"
