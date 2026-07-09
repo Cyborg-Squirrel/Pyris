@@ -199,22 +199,25 @@ class OpenAICompatibleSttClient:
 
         This endpoint is request/response, not wire-streaming, so every event is
         final; a websocket ASR backend implementing
-        :class:`StreamingSttClient` would additionally emit partials. The
-        blocking POST is offloaded per blob so the event loop stays free to keep
-        pulling audio and pushing results to the sink.
+        :class:`StreamingSttClient` would additionally emit partials. Each blob's
+        last segment is marked ``end_of_batch`` so a consumer can tell blobs
+        apart. The blocking POST is offloaded per blob so the event loop stays
+        free to keep pulling audio and pushing results to the sink.
         """
         offset = 0.0
         async for blob in audio:
             transcript = await asyncio.to_thread(
                 self._post_transcription, "audio.wav", blob, model, language
             )
-            for seg in transcript.segments:
+            last = len(transcript.segments) - 1
+            for index, seg in enumerate(transcript.segments):
                 yield TranscriptEvent(
                     segment=TranscriptSegment(
                         start=seg.start + offset,
                         end=seg.end + offset,
                         text=seg.text,
-                    )
+                    ),
+                    end_of_batch=index == last,
                 )
             offset += max((s.end for s in transcript.segments), default=0.0)
 
