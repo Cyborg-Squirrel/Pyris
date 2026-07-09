@@ -130,10 +130,16 @@ class TranscriptEvent:
     ``is_final`` separates a stable, finalized segment from a revisable partial
     hypothesis. A batch-per-blob backend (the bundled one) only ever emits finals;
     a wire-streaming ASR backend also emits partials it may later supersede.
+
+    ``end_of_batch`` is unrelated to finality: it marks the last event produced
+    from a single input blob, for backends (like the bundled one) that transcribe
+    one blob per request. It lets a consumer notice blob boundaries without
+    knowing anything about the streaming transport.
     """
 
     segment: TranscriptSegment
     is_final: bool = True
+    end_of_batch: bool = False
 
 
 @dataclass

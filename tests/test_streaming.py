@@ -187,7 +187,52 @@ def test_streaming_client_offsets_timeline_across_blobs(monkeypatch):
     events = asyncio.run(run())
     got = [(e.segment.text, e.segment.start, e.segment.end) for e in events]
     assert got == [("a", 0.0, 1.0), ("b", 1.0, 2.0), ("c", 2.0, 3.5)]
+    # every event is final -- this transport has no partial hypotheses...
     assert all(e.is_final for e in events)
+    # ...but end_of_batch marks only the last segment of each blob's response.
+    assert [e.end_of_batch for e in events] == [False, True, True]
+
+
+def test_streaming_client_marks_end_of_batch_on_single_segment_blobs(monkeypatch):
+    # A blob whose response has exactly one segment is end_of_batch immediately.
+    responses = iter(
+        [
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "a"}]},
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "b"}]},
+        ]
+    )
+    monkeypatch.setattr(llm, "_send", lambda req, timeout: next(responses))
+    client = llm.OpenAICompatibleSttClient(
+        SttConfig(base_url="http://x/v1", api_key="k", model="whisper")
+    )
+
+    async def blobs():
+        yield b"blob-one"
+        yield b"blob-two"
+
+    async def run():
+        return [e async for e in client.stream_transcribe(blobs(), model="whisper")]
+
+    events = asyncio.run(run())
+    assert [e.end_of_batch for e in events] == [True, True]
+
+
+def test_streaming_client_no_events_for_empty_blob_response(monkeypatch):
+    # A blob whose response has no segments yields nothing (and doesn't crash
+    # trying to compute end_of_batch against an empty list).
+    responses = iter([{"segments": []}])
+    monkeypatch.setattr(llm, "_send", lambda req, timeout: next(responses))
+    client = llm.OpenAICompatibleSttClient(
+        SttConfig(base_url="http://x/v1", api_key="k", model="whisper")
+    )
+
+    async def blobs():
+        yield b"blob-one"
+
+    async def run():
+        return [e async for e in client.stream_transcribe(blobs(), model="whisper")]
+
+    assert asyncio.run(run()) == []
 
 
 # -- bundled WAV streaming provider ------------------------------------------
