@@ -238,6 +238,12 @@ class SubprocessFfmpeg:
             # decode frames just to compare them.
             filters.append("mpdecimate")
         filters.append(f"scale=w='min({int(max_dim)}\\,iw)':h=-2")
+        # Relabel to full-range JPEG 4:2:0. Twitch (and other) clips are
+        # limited-range ("tv") yuv420p, which ffmpeg 8.x's mjpeg encoder rejects
+        # outright ("Non full-range YUV is non-standard") — so without this the
+        # encoder never opens and zero frames are written. Must come before
+        # showinfo so the logged frame count matches what is encoded.
+        filters.append("format=yuvj420p")
         filters.append("showinfo")
         vf = ",".join(filters)
 
@@ -247,7 +253,7 @@ class SubprocessFfmpeg:
             cmd = [self._ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info"]
             cmd += self._seek_args(time_range)
             cmd += ["-i", str(path)]
-            cmd += ["-vf", vf, "-vsync", "vfr", "-q:v", "3", out_pattern]
+            cmd += ["-vf", vf, "-fps_mode", "vfr", "-q:v", "3", out_pattern]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 raise FfmpegError(
