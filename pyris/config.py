@@ -44,7 +44,7 @@ class SamplingConfig:
 
     default_fps: float = 1.0
     max_frames: int = 60  # hard cap regardless of fps/duration
-    scene_detection: bool = True  # prefer scene-change frames over fixed cadence
+    scene_detection: bool = False  # prefer scene-change frames over fixed cadence
     scene_threshold: float = 0.3
     dedup_near_identical: bool = True
 
