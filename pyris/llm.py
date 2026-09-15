@@ -175,6 +175,11 @@ class OpenAICompatibleSttClient:
         self._config = config
         self._url = _join_url(config.base_url, "audio/transcriptions")
         self._timeout = 120.0
+        # Sticky per-instance: once a server rejects verbose_json, stop
+        # paying for the doomed-to-fail attempt (and its full audio upload)
+        # on every subsequent call. Benign to race across threads — worst
+        # case is one extra redundant 400 during concurrent first calls.
+        self._verbose_json_supported = True
 
     def with_timeout(self, timeout: float) -> "OpenAICompatibleSttClient":
         self._timeout = timeout
@@ -228,6 +233,8 @@ class OpenAICompatibleSttClient:
     def _post_transcription(
         self, filename: str, data: bytes, model: str, language: str | None
     ) -> Transcript:
+        if not self._verbose_json_supported:
+            return self._transcribe_with_format(filename, data, model, language, "json")
         try:
             resp = self._request_transcription(
                 filename, data, model, language, response_format="verbose_json"
@@ -236,16 +243,30 @@ class OpenAICompatibleSttClient:
             # Some OpenAI-compatible servers (e.g. llama.cpp-based backends)
             # only support the plain "json" response_format and reject
             # "verbose_json" outright with a 400 before returning a body we
-            # could otherwise degrade gracefully from. Retry once without
-            # segment timestamps rather than failing the whole transcription.
+            # could otherwise degrade gracefully from. Fall back once without
+            # segment timestamps rather than failing the whole transcription,
+            # and remember it so later calls skip the doomed first attempt
+            # (and its full audio upload) entirely.
             if exc.status != 400:
                 raise TranscriptionError(str(exc)) from exc
-            try:
-                resp = self._request_transcription(
-                    filename, data, model, language, response_format="json"
-                )
-            except _HttpFailure as retry_exc:
-                raise TranscriptionError(str(retry_exc)) from retry_exc
+            self._verbose_json_supported = False
+            return self._transcribe_with_format(filename, data, model, language, "json")
+        return _parse_transcription(resp)
+
+    def _transcribe_with_format(
+        self,
+        filename: str,
+        data: bytes,
+        model: str,
+        language: str | None,
+        response_format: str,
+    ) -> Transcript:
+        try:
+            resp = self._request_transcription(
+                filename, data, model, language, response_format=response_format
+            )
+        except _HttpFailure as exc:
+            raise TranscriptionError(str(exc)) from exc
         return _parse_transcription(resp)
 
     def _request_transcription(
