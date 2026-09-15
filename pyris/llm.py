@@ -115,13 +115,17 @@ def _send(req: urllib.request.Request, timeout: float) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
-        raise _HttpFailure(f"HTTP {exc.code}: {detail}") from exc
+        raise _HttpFailure(f"HTTP {exc.code}: {detail}", status=exc.code) from exc
     except urllib.error.URLError as exc:
         raise _HttpFailure(f"request failed: {exc.reason}") from exc
 
 
 class _HttpFailure(Exception):
     """Internal: re-wrapped into Vision/Transcription errors by callers."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class OpenAICompatibleVisionClient:
@@ -171,6 +175,11 @@ class OpenAICompatibleSttClient:
         self._config = config
         self._url = _join_url(config.base_url, "audio/transcriptions")
         self._timeout = 120.0
+        # Sticky per-instance: once a server rejects verbose_json, stop
+        # paying for the doomed-to-fail attempt (and its full audio upload)
+        # on every subsequent call. Benign to race across threads — worst
+        # case is one extra redundant 400 during concurrent first calls.
+        self._verbose_json_supported = True
 
     def with_timeout(self, timeout: float) -> "OpenAICompatibleSttClient":
         self._timeout = timeout
@@ -224,7 +233,52 @@ class OpenAICompatibleSttClient:
     def _post_transcription(
         self, filename: str, data: bytes, model: str, language: str | None
     ) -> Transcript:
-        fields = {"model": model, "response_format": "verbose_json"}
+        if not self._verbose_json_supported:
+            return self._transcribe_with_format(filename, data, model, language, "json")
+        try:
+            resp = self._request_transcription(
+                filename, data, model, language, response_format="verbose_json"
+            )
+        except _HttpFailure as exc:
+            # Some OpenAI-compatible servers (e.g. llama.cpp-based backends)
+            # only support the plain "json" response_format and reject
+            # "verbose_json" outright with a 400 before returning a body we
+            # could otherwise degrade gracefully from. Fall back once without
+            # segment timestamps rather than failing the whole transcription,
+            # and remember it so later calls skip the doomed first attempt
+            # (and its full audio upload) entirely.
+            if exc.status != 400:
+                raise TranscriptionError(str(exc)) from exc
+            self._verbose_json_supported = False
+            return self._transcribe_with_format(filename, data, model, language, "json")
+        return _parse_transcription(resp)
+
+    def _transcribe_with_format(
+        self,
+        filename: str,
+        data: bytes,
+        model: str,
+        language: str | None,
+        response_format: str,
+    ) -> Transcript:
+        try:
+            resp = self._request_transcription(
+                filename, data, model, language, response_format=response_format
+            )
+        except _HttpFailure as exc:
+            raise TranscriptionError(str(exc)) from exc
+        return _parse_transcription(resp)
+
+    def _request_transcription(
+        self,
+        filename: str,
+        data: bytes,
+        model: str,
+        language: str | None,
+        *,
+        response_format: str,
+    ) -> dict:
+        fields = {"model": model, "response_format": response_format}
         if language:
             fields["language"] = language
         body, content_type = _encode_multipart_bytes(fields, filename, data)
@@ -233,11 +287,7 @@ class OpenAICompatibleSttClient:
             "Content-Type": content_type,
         }
         req = urllib.request.Request(self._url, data=body, headers=headers)
-        try:
-            resp = _send(req, self._timeout)
-        except _HttpFailure as exc:
-            raise TranscriptionError(str(exc)) from exc
-        return _parse_transcription(resp)
+        return _send(req, self._timeout)
 
 
 # -- response/payload helpers -----------------------------------------------
